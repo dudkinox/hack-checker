@@ -50,7 +50,7 @@ System Settings -> Privacy & Security -> Screen & System Audio Recording.
 Run the app:
 
 ```bash
-python checkers_advisor_tk.py
+./run_checkers_advisor.sh
 ```
 
 Basic flow:
@@ -72,3 +72,5 @@ The result image uses:
 - Orange X marks for captured pieces.
 
 If detection misses pieces, increase `ความไว`. If it marks empty squares as pieces, decrease it. You can also choose `สีเข้ม` or `สีอ่อน`, then analyze again.
+
+If the result becomes black, make sure the app window is not covering the game board. The app will try to move itself away after selection, but you can still drag it elsewhere. On macOS, also allow Screen Recording for Terminal or your editor.

@@ -10,13 +10,14 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mss
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageStat, ImageTk
 
 
 RGB = Tuple[float, float, float]
 Square = Tuple[int, int]
 
 BOARD_SIZE = 8
+MAX_DETECTED_PIECES = 24
 OUR_COLOR = (0, 200, 83)
 OPPONENT_COLOR = (229, 57, 53)
 MOVE_COLOR = (255, 214, 10)
@@ -33,6 +34,8 @@ class CellSample:
     background_color: RGB
     diff: float
     luminance: float
+    tag: str = "unknown"
+    is_king: bool = False
 
 
 @dataclass
@@ -56,6 +59,10 @@ class ScreenCapture:
     image: Image.Image
     left: int
     top: int
+    width: int
+    height: int
+    right: int
+    bottom: int
 
 
 def capture_screen(monitor_number: int = 0) -> ScreenCapture:
@@ -69,7 +76,15 @@ def capture_screen(monitor_number: int = 0) -> ScreenCapture:
         monitor = screenshotter.monitors[monitor_number]
         grabbed = screenshotter.grab(monitor)
         image = Image.frombytes("RGB", grabbed.size, grabbed.rgb)
-        return ScreenCapture(image=image, left=monitor["left"], top=monitor["top"])
+        return ScreenCapture(
+            image=image,
+            left=monitor["left"],
+            top=monitor["top"],
+            width=monitor["width"],
+            height=monitor["height"],
+            right=monitor["left"] + monitor["width"],
+            bottom=monitor["top"] + monitor["height"],
+        )
 
 
 def capture_screen_region(rect: Tuple[int, int, int, int]) -> Image.Image:
@@ -83,6 +98,143 @@ def capture_screen_region(rect: Tuple[int, int, int, int]) -> Image.Image:
     with mss.mss() as screenshotter:
         grabbed = screenshotter.grab(region)
         return Image.frombytes("RGB", grabbed.size, grabbed.rgb)
+
+
+def is_nearly_black(image: Image.Image) -> bool:
+    sample = image.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR)
+    stats = ImageStat.Stat(sample)
+    brightest_channel = max(high for _low, high in stats.extrema)
+    return max(stats.mean) < 8 and brightest_channel < 25
+
+
+def draw_capture_warning(board_image: Image.Image, text: str) -> Image.Image:
+    image = board_image.convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    pad = max(12, min(image.size) // 28)
+    draw.rectangle((0, 0, image.width, image.height), fill=(0, 0, 0, 80))
+    draw.rectangle(
+        (pad, pad, image.width - pad, pad + max(56, image.height // 8)),
+        fill=(20, 24, 30, 230),
+        outline=(255, 214, 10, 255),
+        width=2,
+    )
+    draw.text(
+        (pad * 2, pad * 2),
+        text,
+        fill=(255, 255, 255, 255),
+        font=ImageFont.load_default(),
+    )
+    return Image.alpha_composite(image, overlay).convert("RGB")
+
+
+def stddev(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+
+
+def checkerboard_score(image: Image.Image, x: int, y: int, size: int) -> float:
+    pixels = image.load()
+    cell = size / BOARD_SIZE
+    groups = {0: [], 1: []}
+    sample_points = ((0.22, 0.22), (0.78, 0.22), (0.22, 0.78), (0.78, 0.78))
+
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            values = []
+            for frac_x, frac_y in sample_points:
+                px = min(image.width - 1, max(0, int(round(x + (col + frac_x) * cell))))
+                py = min(image.height - 1, max(0, int(round(y + (row + frac_y) * cell))))
+                values.append(luminance(pixels[px, py][:3]))
+            groups[(row + col) % 2].append(sum(values) / len(values))
+
+    mean0 = sum(groups[0]) / len(groups[0])
+    mean1 = sum(groups[1]) / len(groups[1])
+    contrast = abs(mean0 - mean1)
+    consistency_penalty = (stddev(groups[0]) + stddev(groups[1])) * 0.08
+    size_bonus = size * 0.025
+    return contrast - consistency_penalty + size_bonus
+
+
+def refine_checkerboard_box(
+    image: Image.Image, box: Tuple[int, int, int, int]
+) -> Tuple[int, int, int, int]:
+    left, top, right, bottom = box
+    base_size = min(right - left, bottom - top)
+    if base_size < 80:
+        return box
+
+    search = max(4, int(round(base_size * 0.08)))
+    step = max(2, base_size // 120)
+    size_step = max(2, base_size // 80)
+    best_box = box
+    best_score = checkerboard_score(image, left, top, base_size)
+
+    for size in range(
+        max(80, base_size - search),
+        min(min(image.size), base_size + search) + 1,
+        size_step,
+    ):
+        for y in range(max(0, top - search), min(image.height - size, top + search) + 1, step):
+            for x in range(max(0, left - search), min(image.width - size, left + search) + 1, step):
+                score = checkerboard_score(image, x, y, size)
+                if score > best_score:
+                    best_score = score
+                    best_box = (x, y, x + size, y + size)
+
+    return best_box
+
+
+def find_checkerboard_box(image: Image.Image) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
+    if min(image.size) < 96:
+        return None, 0.0
+
+    max_small_side = 220
+    scale = min(1.0, max_small_side / max(image.size))
+    small_size = (
+        max(1, int(round(image.width * scale))),
+        max(1, int(round(image.height * scale))),
+    )
+    small = image.convert("RGB").resize(small_size, Image.Resampling.BILINEAR)
+    small_min = min(small.size)
+    largest = small_min
+    smallest = max(72, int(small_min * 0.42))
+    size_step = max(5, small_min // 28)
+
+    best_box: Optional[Tuple[int, int, int, int]] = None
+    best_score = -9999.0
+
+    for size in range(largest, smallest - 1, -size_step):
+        step = max(4, size // 18)
+        for y in range(0, small.height - size + 1, step):
+            for x in range(0, small.width - size + 1, step):
+                score = checkerboard_score(small, x, y, size)
+                if score > best_score:
+                    best_score = score
+                    best_box = (x, y, x + size, y + size)
+
+    if best_box is None or best_score < 18:
+        return None, best_score
+
+    inv_scale = 1.0 / scale
+    left = max(0, int(round(best_box[0] * inv_scale)))
+    top = max(0, int(round(best_box[1] * inv_scale)))
+    right = min(image.width, int(round(best_box[2] * inv_scale)))
+    bottom = min(image.height, int(round(best_box[3] * inv_scale)))
+    side = min(right - left, bottom - top)
+    if side < 80:
+        return None, best_score
+    refined = refine_checkerboard_box(image, (left, top, left + side, top + side))
+    return refined, best_score
+
+
+def crop_to_checkerboard(image: Image.Image) -> Tuple[Image.Image, Optional[Tuple[int, int, int, int]], float]:
+    box, score = find_checkerboard_box(image)
+    if box is None:
+        return image, None, score
+    return image.crop(box).convert("RGB"), box, score
 
 
 def color_distance(first: RGB, second: RGB) -> float:
@@ -135,6 +287,323 @@ def mean_color_for_boxes(
     )
 
 
+def cell_boxes(row: int, col: int, image: Image.Image) -> Tuple[float, float, float, float]:
+    cell_width = image.width / BOARD_SIZE
+    cell_height = image.height / BOARD_SIZE
+    return (
+        col * cell_width,
+        row * cell_height,
+        (col + 1) * cell_width,
+        (row + 1) * cell_height,
+    )
+
+
+def sample_cell_background(image: Image.Image, row: int, col: int) -> RGB:
+    x0, y0, x1, y1 = cell_boxes(row, col, image)
+    short_side = min(x1 - x0, y1 - y0)
+    corner = short_side * 0.16
+    inset = short_side * 0.06
+    boxes = [
+        (x0 + inset, y0 + inset, x0 + inset + corner, y0 + inset + corner),
+        (x1 - inset - corner, y0 + inset, x1 - inset, y0 + inset + corner),
+        (x0 + inset, y1 - inset - corner, x0 + inset + corner, y1 - inset),
+        (x1 - inset - corner, y1 - inset - corner, x1 - inset, y1 - inset),
+    ]
+    return mean_color_for_boxes(image, boxes)
+
+
+def playable_parity(image: Image.Image) -> int:
+    groups = {0: [], 1: []}
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            groups[(row + col) % 2].append(luminance(sample_cell_background(image, row, col)))
+
+    mean0 = sum(groups[0]) / len(groups[0])
+    mean1 = sum(groups[1]) / len(groups[1])
+    return 0 if mean0 < mean1 else 1
+
+
+def center_disk_stats(image: Image.Image, row: int, col: int) -> Dict[str, float]:
+    x0, y0, x1, y1 = cell_boxes(row, col, image)
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    radius = min(x1 - x0, y1 - y0) * 0.39
+    radius_sq = radius * radius
+    left = max(0, int(round(cx - radius)))
+    top = max(0, int(round(cy - radius)))
+    right = min(image.width, int(round(cx + radius)))
+    bottom = min(image.height, int(round(cy + radius)))
+
+    pixels = image.load()
+    red_total = 0.0
+    green_total = 0.0
+    blue_total = 0.0
+    luminances: List[float] = []
+    orange = 0
+    cyan = 0
+    gray = 0
+    bright = 0
+    dark_edge = 0
+    count = 0
+
+    for y in range(top, bottom):
+        for x in range(left, right):
+            if (x - cx) ** 2 + (y - cy) ** 2 > radius_sq:
+                continue
+            red, green, blue = pixels[x, y][:3]
+            lum = luminance((red, green, blue))
+            red_total += red
+            green_total += green
+            blue_total += blue
+            luminances.append(lum)
+            count += 1
+
+            spread = max(red, green, blue) - min(red, green, blue)
+            if red > 135 and 45 < green < 190 and blue < 125 and red > green + 18:
+                orange += 1
+            if green > 95 and blue > 105 and red < 135 and blue > red + 20:
+                cyan += 1
+            if 55 < lum < 230 and spread < 55:
+                gray += 1
+            if red > 170 and green > 160 and blue > 130:
+                bright += 1
+            if lum < 75:
+                dark_edge += 1
+
+    if count == 0:
+        return {
+            "red": 0.0,
+            "green": 0.0,
+            "blue": 0.0,
+            "lum": 0.0,
+            "texture": 0.0,
+            "orange_ratio": 0.0,
+            "cyan_ratio": 0.0,
+            "gray_ratio": 0.0,
+            "bright_ratio": 0.0,
+            "dark_ratio": 0.0,
+        }
+
+    return {
+        "red": red_total / count,
+        "green": green_total / count,
+        "blue": blue_total / count,
+        "lum": sum(luminances) / count,
+        "texture": stddev(luminances),
+        "orange_ratio": orange / count,
+        "cyan_ratio": cyan / count,
+        "gray_ratio": gray / count,
+        "bright_ratio": bright / count,
+        "dark_ratio": dark_edge / count,
+    }
+
+
+def piece_extent_stats(
+    image: Image.Image, row: int, col: int, tag: str, background: RGB
+) -> Dict[str, float]:
+    x0, y0, x1, y1 = cell_boxes(row, col, image)
+    cell_w = max(1.0, x1 - x0)
+    cell_h = max(1.0, y1 - y0)
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    central_radius = min(cell_w, cell_h) * 0.37
+    central_radius_sq = central_radius * central_radius
+
+    left = max(0, int(round(x0 + cell_w * 0.03)))
+    top = max(0, int(round(y0 + cell_h * 0.03)))
+    right = min(image.width, int(round(x1 - cell_w * 0.03)))
+    bottom = min(image.height, int(round(y1 - cell_h * 0.03)))
+
+    pixels = image.load()
+    min_x = right
+    min_y = bottom
+    max_x = left
+    max_y = top
+    mask_count = 0
+    outer_count = 0
+
+    for y in range(top, bottom):
+        for x in range(left, right):
+            red, green, blue = pixels[x, y][:3]
+            spread = max(red, green, blue) - min(red, green, blue)
+            lum = luminance((red, green, blue))
+            distance = color_distance(background, (red, green, blue))
+
+            is_orange = red > 135 and 45 < green < 190 and blue < 125 and red > green + 18
+            is_cyan = green > 95 and blue > 105 and red < 135 and blue > red + 20
+            is_bright = red > 170 and green > 160 and blue > 130
+            is_gray = 55 < lum < 230 and spread < 55
+            is_dark = lum < 75
+
+            if tag == "orange":
+                is_piece_pixel = distance > 24 and (is_orange or is_cyan or is_bright or is_dark)
+            else:
+                is_piece_pixel = distance > 22 and (is_gray or is_bright or is_dark)
+
+            if not is_piece_pixel:
+                continue
+
+            mask_count += 1
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x)
+            max_y = max(max_y, y)
+            if (x - cx) ** 2 + (y - cy) ** 2 > central_radius_sq:
+                outer_count += 1
+
+    if mask_count == 0:
+        return {
+            "bbox_w_ratio": 0.0,
+            "bbox_h_ratio": 0.0,
+            "area_ratio": 0.0,
+            "outer_ratio": 0.0,
+        }
+
+    return {
+        "bbox_w_ratio": (max_x - min_x + 1) / cell_w,
+        "bbox_h_ratio": (max_y - min_y + 1) / cell_h,
+        "area_ratio": mask_count / (cell_w * cell_h),
+        "outer_ratio": outer_count / mask_count,
+    }
+
+
+def looks_like_game_indy_king(extent: Dict[str, float], tag: str) -> bool:
+    if tag == "orange":
+        return (
+            extent["area_ratio"] >= 0.24
+            and (
+                extent["bbox_w_ratio"] >= 0.76
+                or extent["bbox_h_ratio"] >= 0.74
+                or extent["outer_ratio"] >= 0.22
+            )
+        )
+
+    return (
+        extent["area_ratio"] >= 0.20
+        and (
+            extent["bbox_w_ratio"] >= 0.74
+            or extent["bbox_h_ratio"] >= 0.72
+            or extent["outer_ratio"] >= 0.24
+        )
+    )
+
+
+def detect_game_indy_samples(board_image: Image.Image) -> List[CellSample]:
+    image = board_image.convert("RGB")
+    parity = playable_parity(image)
+    samples: List[CellSample] = []
+
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if (row + col) % 2 != parity:
+                continue
+
+            background = sample_cell_background(image, row, col)
+            stats = center_disk_stats(image, row, col)
+            center = (stats["red"], stats["green"], stats["blue"])
+            diff = color_distance(background, center)
+
+            orange_score = (
+                stats["orange_ratio"] * 110
+                + stats["cyan_ratio"] * 170
+                + stats["texture"] * 0.85
+                + diff * 0.45
+            )
+            gray_score = (
+                stats["gray_ratio"] * 105
+                + stats["bright_ratio"] * 35
+                + stats["dark_ratio"] * 25
+                + diff * 0.55
+                + stats["texture"] * 0.35
+            )
+
+            tag = ""
+            confidence = 0.0
+            has_logo_or_cap_texture = (
+                stats["cyan_ratio"] >= 0.008
+                or stats["bright_ratio"] >= 0.13
+            )
+            orange_has_blue_logo = stats["cyan_ratio"] >= 0.035 and diff >= 8
+            orange_has_bright_logo = stats["bright_ratio"] >= 0.13 and diff >= 16
+            if (
+                orange_score >= 58
+                and stats["orange_ratio"] >= 0.12
+                and has_logo_or_cap_texture
+                and (orange_has_blue_logo or orange_has_bright_logo)
+            ):
+                tag = "orange"
+                confidence = orange_score
+            has_metal_shape = stats["texture"] >= 10 or stats["dark_ratio"] >= 0.045
+            if (
+                gray_score >= max(50, confidence + 4)
+                and stats["gray_ratio"] >= 0.24
+                and diff >= 18
+                and has_metal_shape
+            ):
+                tag = "gray"
+                confidence = gray_score
+
+            if not tag:
+                continue
+
+            extent = piece_extent_stats(image, row, col, tag, background)
+            samples.append(
+                CellSample(
+                    row=row,
+                    col=col,
+                    center_color=center,
+                    background_color=background,
+                    diff=confidence,
+                    luminance=stats["lum"],
+                    tag=tag,
+                    is_king=looks_like_game_indy_king(extent, tag),
+                )
+            )
+
+    samples.sort(key=lambda sample: sample.diff, reverse=True)
+    return samples[:MAX_DETECTED_PIECES]
+
+
+def detect_game_indy_board(board_image: Image.Image, our_side: str) -> Tuple[Board, List[CellSample]]:
+    samples = detect_game_indy_samples(board_image)
+    board: Board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+
+    if not samples:
+        return board, samples
+
+    tag_rows: Dict[str, List[int]] = {"orange": [], "gray": []}
+    for sample in samples:
+        tag_rows.setdefault(sample.tag, []).append(sample.row)
+
+    tag_owner: Dict[str, str] = {}
+    if tag_rows.get("orange") and tag_rows.get("gray"):
+        orange_row = sum(tag_rows["orange"]) / len(tag_rows["orange"])
+        gray_row = sum(tag_rows["gray"]) / len(tag_rows["gray"])
+        if our_side == "bottom":
+            our_tag = "orange" if orange_row > gray_row else "gray"
+        else:
+            our_tag = "orange" if orange_row < gray_row else "gray"
+        tag_owner = {
+            our_tag: "ours",
+            "gray" if our_tag == "orange" else "orange": "opponent",
+        }
+    else:
+        for sample in samples:
+            if our_side == "bottom":
+                owner = "ours" if sample.row >= BOARD_SIZE / 2 else "opponent"
+            else:
+                owner = "ours" if sample.row < BOARD_SIZE / 2 else "opponent"
+            tag_owner[sample.tag] = owner
+
+    for sample in samples:
+        board[sample.row][sample.col] = Piece(
+            owner=tag_owner.get(sample.tag, "opponent"),
+            is_king=sample.is_king,
+        )
+
+    return board, samples
+
+
 def sample_board_cells(board_image: Image.Image, threshold: int) -> List[CellSample]:
     image = board_image.convert("RGB")
     cell_width = image.width / BOARD_SIZE
@@ -181,7 +650,8 @@ def sample_board_cells(board_image: Image.Image, threshold: int) -> List[CellSam
                     )
                 )
 
-    return samples
+    samples.sort(key=lambda sample: sample.diff, reverse=True)
+    return samples[:MAX_DETECTED_PIECES]
 
 
 def split_samples_by_color(samples: Sequence[CellSample]) -> Dict[int, List[CellSample]]:
@@ -325,6 +795,54 @@ def find_captures_from(
     moves: List[Move] = []
 
     for dr, dc in capture_directions(piece, our_side, men_capture_backward):
+        if piece.is_king:
+            middle: Optional[Square] = None
+            scan_row = row + dr
+            scan_col = col + dc
+            while in_bounds(scan_row, scan_col):
+                scanned_piece = board[scan_row][scan_col]
+                if middle is None:
+                    if scanned_piece is None:
+                        scan_row += dr
+                        scan_col += dc
+                        continue
+                    if scanned_piece.owner == piece.owner:
+                        break
+                    middle = (scan_row, scan_col)
+                    scan_row += dr
+                    scan_col += dc
+                    continue
+
+                if scanned_piece is not None:
+                    break
+
+                destination = (scan_row, scan_col)
+                next_board = clone_board(board)
+                next_board[start[0]][start[1]] = None
+                next_board[current[0]][current[1]] = None
+                next_board[middle[0]][middle[1]] = None
+                moved_piece = maybe_promote(piece, destination[0], our_side)
+                next_board[destination[0]][destination[1]] = moved_piece
+
+                deeper = find_captures_from(
+                    next_board,
+                    destination,
+                    destination,
+                    moved_piece,
+                    path + [destination],
+                    captures + [middle],
+                    our_side,
+                    men_capture_backward,
+                )
+                if deeper:
+                    moves.extend(deeper)
+                else:
+                    moves.append(Move(path=path + [destination], captures=captures + [middle]))
+
+                scan_row += dr
+                scan_col += dc
+            continue
+
         middle = (row + dr, col + dc)
         destination = (row + dr * 2, col + dc * 2)
         if not in_bounds(*middle) or not in_bounds(*destination):
@@ -364,6 +882,23 @@ def find_captures_from(
     return moves
 
 
+def generate_simple_moves_from(board: Board, row: int, col: int, piece: Piece, our_side: str) -> List[Move]:
+    moves: List[Move] = []
+    for dr, dc in simple_directions(piece, our_side):
+        if piece.is_king:
+            scan_row = row + dr
+            scan_col = col + dc
+            while in_bounds(scan_row, scan_col) and board[scan_row][scan_col] is None:
+                moves.append(Move(path=[(row, col), (scan_row, scan_col)], captures=[]))
+                scan_row += dr
+                scan_col += dc
+        else:
+            destination = (row + dr, col + dc)
+            if in_bounds(*destination) and board[destination[0]][destination[1]] is None:
+                moves.append(Move(path=[(row, col), destination], captures=[]))
+    return moves
+
+
 def generate_moves_for_owner(
     board: Board, owner: str, our_side: str, men_capture_backward: bool
 ) -> List[Move]:
@@ -389,10 +924,7 @@ def generate_moves_for_owner(
                 )
             )
 
-            for dr, dc in simple_directions(piece, our_side):
-                destination = (row + dr, col + dc)
-                if in_bounds(*destination) and board[destination[0]][destination[1]] is None:
-                    simple_moves.append(Move(path=[(row, col), destination], captures=[]))
+            simple_moves.extend(generate_simple_moves_from(board, row, col, piece, our_side))
 
     return captures if captures else simple_moves
 
@@ -420,6 +952,16 @@ def advancement_score(owner: str, row: int, our_side: str) -> float:
     return row if our_side == "bottom" else (BOARD_SIZE - 1 - row)
 
 
+def capture_value(board: Board, move: Move) -> float:
+    value = 0.0
+    for row, col in move.captures:
+        piece = board[row][col]
+        if piece is None:
+            continue
+        value += 2.2 if piece.is_king else 1.0
+    return value
+
+
 def score_move(
     board: Board, move: Move, our_side: str, men_capture_backward: bool
 ) -> float:
@@ -429,12 +971,14 @@ def score_move(
     if piece is None:
         return -9999.0
 
-    score = len(move.captures) * 100.0
+    score = capture_value(board, move) * 100.0
     score += advancement_score(piece.owner, destination[0], our_side) * 4.0
 
     center_distance = abs(destination[0] - 3.5) + abs(destination[1] - 3.5)
     score += (7.0 - center_distance) * 1.5
 
+    if piece.is_king:
+        score += 12.0
     if not piece.is_king and destination[0] == promotion_row(piece.owner, our_side):
         score += 35.0
 
@@ -442,10 +986,19 @@ def score_move(
     opponent_moves = generate_moves_for_owner(
         next_board, "opponent", our_side, men_capture_backward
     )
-    opponent_capture_count = 0
+    opponent_capture_value = 0.0
+    moved_piece_can_be_captured = False
     for opponent_move in opponent_moves:
-        opponent_capture_count = max(opponent_capture_count, len(opponent_move.captures))
-    score -= opponent_capture_count * 18.0
+        opponent_capture_value = max(
+            opponent_capture_value,
+            capture_value(next_board, opponent_move),
+        )
+        if destination in opponent_move.captures:
+            moved_piece_can_be_captured = True
+
+    score -= opponent_capture_value * 85.0
+    if moved_piece_can_be_captured:
+        score -= 55.0 if not piece.is_king else 120.0
     return score
 
 
@@ -644,10 +1197,11 @@ class CheckersAdvisorApp:
         self.root = root
         self.root.title("ตัวช่วยหมากฮอส")
         self.root.geometry("1180x760")
-        self.root.minsize(940, 620)
+        self.root.minsize(360, 360)
 
         self.screenshot: Optional[Image.Image] = None
         self.screenshot_origin = (0, 0)
+        self.monitor_rect: Optional[Tuple[int, int, int, int]] = None
         self.result_image: Optional[Image.Image] = None
         self.screen_photo: Optional[ImageTk.PhotoImage] = None
         self.result_photo: Optional[ImageTk.PhotoImage] = None
@@ -826,6 +1380,7 @@ class CheckersAdvisorApp:
             capture = capture_screen(self.monitor_var.get())
             self.screenshot = capture.image
             self.screenshot_origin = (capture.left, capture.top)
+            self.monitor_rect = (capture.left, capture.top, capture.right, capture.bottom)
             self.selection_display = None
             self.selection_image = None
             self.result_image = None
@@ -857,6 +1412,7 @@ class CheckersAdvisorApp:
             self.stop_realtime(status=False)
             self.screenshot = Image.open(path).convert("RGB")
             self.screenshot_origin = (0, 0)
+            self.monitor_rect = None
             self.selection_display = None
             self.selection_image = None
             self.result_image = None
@@ -1047,40 +1603,164 @@ class CheckersAdvisorApp:
         return (left, top, left + side, top + side)
 
     def selected_screen_rect(self) -> Optional[Tuple[int, int, int, int]]:
-        if self.selection_image is None:
+        if self.selection_image is None or self.screenshot is None:
             return None
-        origin_x, origin_y = self.screenshot_origin
+        if self.monitor_rect is None:
+            origin_x, origin_y = self.screenshot_origin
+            left, top, right, bottom = self.selection_image
+            return (
+                origin_x + left,
+                origin_y + top,
+                origin_x + right,
+                origin_y + bottom,
+            )
+
+        monitor_left, monitor_top, monitor_right, monitor_bottom = self.monitor_rect
+        monitor_width = max(1, monitor_right - monitor_left)
+        monitor_height = max(1, monitor_bottom - monitor_top)
+        scale_x = monitor_width / max(1, self.screenshot.width)
+        scale_y = monitor_height / max(1, self.screenshot.height)
         left, top, right, bottom = self.selection_image
         return (
-            origin_x + left,
-            origin_y + top,
-            origin_x + right,
-            origin_y + bottom,
+            monitor_left + int(round(left * scale_x)),
+            monitor_top + int(round(top * scale_y)),
+            monitor_left + int(round(right * scale_x)),
+            monitor_top + int(round(bottom * scale_y)),
         )
+
+    def rects_overlap(
+        self, first: Tuple[int, int, int, int], second: Tuple[int, int, int, int]
+    ) -> bool:
+        return not (
+            first[2] <= second[0]
+            or first[0] >= second[2]
+            or first[3] <= second[1]
+            or first[1] >= second[3]
+        )
+
+    def move_window_away_from_selection(self) -> None:
+        selected = self.selected_screen_rect()
+        if selected is None:
+            return
+
+        tk_monitor = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        if self.monitor_rect is not None:
+            src_left, src_top, src_right, src_bottom = self.monitor_rect
+            src_width = max(1, src_right - src_left)
+            src_height = max(1, src_bottom - src_top)
+            scale_x = tk_monitor[2] / src_width
+            scale_y = tk_monitor[3] / src_height
+            selected = (
+                int(round((selected[0] - src_left) * scale_x)),
+                int(round((selected[1] - src_top) * scale_y)),
+                int(round((selected[2] - src_left) * scale_x)),
+                int(round((selected[3] - src_top) * scale_y)),
+            )
+
+        mon_left, mon_top, mon_right, mon_bottom = tk_monitor
+        mon_width = max(1, mon_right - mon_left)
+        mon_height = max(1, mon_bottom - mon_top)
+        pad = 24
+
+        try:
+            self.root.attributes("-fullscreen", False)
+        except tk.TclError:
+            pass
+        try:
+            self.root.state("normal")
+        except tk.TclError:
+            pass
+        self.root.resizable(True, True)
+        self.root.update_idletasks()
+        win_width = min(460, max(360, mon_width - pad * 2))
+        win_height = min(560, max(360, mon_height - pad * 2))
+
+        left, top, right, bottom = selected
+        vertical_anchor = min(
+            max(top, mon_top + pad),
+            max(mon_top + pad, mon_bottom - win_height - pad),
+        )
+        horizontal_anchor = min(
+            max(left, mon_left + pad),
+            max(mon_left + pad, mon_right - win_width - pad),
+        )
+
+        candidates = [
+            (right + pad, vertical_anchor),
+            (left - win_width - pad, vertical_anchor),
+            (horizontal_anchor, bottom + pad),
+            (horizontal_anchor, top - win_height - pad),
+            (mon_right - win_width - pad, mon_top + pad),
+            (mon_left + pad, mon_top + pad),
+        ]
+
+        chosen = None
+        for x, y in candidates:
+            if (
+                x < mon_left + pad
+                or y < mon_top + pad
+                or x + win_width > mon_right - pad
+                or y + win_height > mon_bottom - pad
+            ):
+                continue
+            window_rect = (x, y, x + win_width, y + win_height)
+            if not self.rects_overlap(window_rect, selected):
+                chosen = (x, y)
+                break
+
+        if chosen is None:
+            selected_center_x = (left + right) / 2
+            if selected_center_x < mon_left + mon_width / 2:
+                chosen = (mon_right - win_width - pad, mon_top + pad)
+            else:
+                chosen = (mon_left + pad, mon_top + pad)
+
+        self.root.geometry(f"{int(win_width)}x{int(win_height)}+{int(chosen[0])}+{int(chosen[1])}")
+        self.root.update_idletasks()
 
     def analyze_board_image(
         self, board_image: Image.Image, realtime: bool = False
     ) -> Tuple[int, Optional[Move], List[CellSample]]:
+        if realtime and is_nearly_black(board_image):
+            self.result_image = draw_capture_warning(board_image, "BLACK CAPTURE")
+            self.status_var.set(
+                "ภาพที่จับได้ดำ: ขยับหน้าต่างแอปไม่ให้บังกระดาน "
+                "หรือเปิดสิทธิ์ Screen Recording"
+            )
+            self.redraw_result()
+            return 0, None, []
+
+        cropped_board, crop_box, crop_score = crop_to_checkerboard(board_image)
         threshold = max(15, 105 - int(round(float(self.threshold_var.get()))))
-        board, samples = detect_board(
-            board_image,
-            threshold,
-            self.side_value(),
-            self.color_value(),
-        )
+        board, samples = detect_game_indy_board(cropped_board, self.side_value())
+        detector_name = "Game Indy"
+
+        if len(samples) < 2:
+            board, samples = detect_board(
+                cropped_board,
+                threshold,
+                self.side_value(),
+                self.color_value(),
+            )
+            detector_name = "generic"
+
         move = best_move(
             board,
             self.side_value(),
             self.backward_capture_var.get(),
         )
-        self.result_image = annotate_board(board_image, board, move)
+        self.result_image = annotate_board(cropped_board, board, move)
         pieces = sum(1 for row in board for piece in row if piece is not None)
 
         if not samples:
             self.status_var.set("ไม่พบหมาก ลองเพิ่มค่า ความไว หรือเลือกกรอบใหม่")
         else:
             prefix = "เรียลไทม์" if realtime else "ภาพนิ่ง"
-            self.status_var.set(f"{prefix}: {describe_move(move)} | พบหมาก {pieces} ตัว")
+            crop_text = "ครอปกระดานแล้ว" if crop_box is not None else "ใช้กรอบเดิม"
+            self.status_var.set(
+                f"{prefix}: {describe_move(move)} | พบหมาก {pieces} ตัว | "
+                f"{detector_name}, {crop_text} ({crop_score:.1f})"
+            )
 
         self.redraw_result()
         return pieces, move, samples
@@ -1107,13 +1787,20 @@ class CheckersAdvisorApp:
         if self.selected_screen_rect() is None:
             messagebox.showinfo("ยังไม่ได้เลือกกระดาน", "เลือกพื้นที่หน้าจอก่อน")
             return
+        if self.monitor_rect is None:
+            messagebox.showinfo(
+                "ไม่มีพิกัดหน้าจอ",
+                "โหมดเรียลไทม์ต้องเลือกพื้นที่หน้าจอ ไม่ใช่เปิดภาพจากไฟล์",
+            )
+            return
 
         self.stop_realtime(status=False)
         self.realtime_running = True
         self.last_realtime_error = ""
         self.realtime_button_text.set("หยุดเรียลไทม์")
+        self.move_window_away_from_selection()
         self.status_var.set("เริ่มวิเคราะห์แบบเรียลไทม์")
-        self.run_realtime_tick()
+        self.realtime_after_id = self.root.after(550, self.run_realtime_tick)
 
     def stop_realtime(self, status: bool = True) -> None:
         if self.realtime_after_id is not None:
@@ -1146,7 +1833,11 @@ class CheckersAdvisorApp:
                 self.last_realtime_error = message
 
         if self.realtime_running:
-            delay = max(250, int(self.interval_var.get()))
+            try:
+                delay = max(250, int(self.interval_var.get()))
+            except (tk.TclError, ValueError):
+                delay = 700
+                self.interval_var.set(delay)
             self.realtime_after_id = self.root.after(delay, self.run_realtime_tick)
 
     def close(self) -> None:
