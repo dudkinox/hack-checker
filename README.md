@@ -1,6 +1,6 @@
 # Python Screen Capture
 
-Small command-line tool and Tkinter app for capturing screenshots. The Tkinter app can help analyze an 8x8 checkers board from a screenshot and draw a recommended move.
+Small command-line tool and Tkinter app for capturing screenshots. The Tkinter app can analyze an 8x8 checkers board from a selected screen region and update the recommended move in real time.
 
 ## Install
 
@@ -55,11 +55,13 @@ python checkers_advisor_tk.py
 
 Basic flow:
 
-1. Click `จับหน้าจอ` or `เปิดภาพ`.
+1. Click `เลือกพื้นที่หน้าจอ`.
 2. Drag a square around the 8x8 board.
-3. Choose which side is yours: `ล่าง` or `บน`.
-4. Choose your piece color, or keep `อัตโนมัติ`.
-5. Click `วิเคราะห์`.
+3. Release the mouse. Real-time analysis starts automatically.
+4. Choose which side is yours: `ล่าง` or `บน`.
+5. Choose your piece color, or keep `อัตโนมัติ`.
+
+Use `หยุดเรียลไทม์` to pause, or `เริ่มเรียลไทม์` to resume with the same selected screen region. Use `จับภาพนิ่ง` or `เปิดภาพ` when you only want to analyze one still image.
 
 The result image uses:
 

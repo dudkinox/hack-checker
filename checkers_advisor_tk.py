@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import time
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
@@ -1109,6 +1108,7 @@ class CheckersAdvisorApp:
             messagebox.showinfo("ยังไม่ได้เลือกกระดาน", "เลือกพื้นที่หน้าจอก่อน")
             return
 
+        self.stop_realtime(status=False)
         self.realtime_running = True
         self.last_realtime_error = ""
         self.realtime_button_text.set("หยุดเรียลไทม์")
