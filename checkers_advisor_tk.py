@@ -52,7 +52,14 @@ class Move:
 Board = List[List[Optional[Piece]]]
 
 
-def capture_screen(monitor_number: int = 0) -> Image.Image:
+@dataclass
+class ScreenCapture:
+    image: Image.Image
+    left: int
+    top: int
+
+
+def capture_screen(monitor_number: int = 0) -> ScreenCapture:
     with mss.mss() as screenshotter:
         if monitor_number >= len(screenshotter.monitors):
             raise ValueError(
@@ -60,7 +67,22 @@ def capture_screen(monitor_number: int = 0) -> Image.Image:
                 f"Available monitors: 0-{len(screenshotter.monitors) - 1}"
             )
 
-        grabbed = screenshotter.grab(screenshotter.monitors[monitor_number])
+        monitor = screenshotter.monitors[monitor_number]
+        grabbed = screenshotter.grab(monitor)
+        image = Image.frombytes("RGB", grabbed.size, grabbed.rgb)
+        return ScreenCapture(image=image, left=monitor["left"], top=monitor["top"])
+
+
+def capture_screen_region(rect: Tuple[int, int, int, int]) -> Image.Image:
+    left, top, right, bottom = rect
+    region = {
+        "left": left,
+        "top": top,
+        "width": max(1, right - left),
+        "height": max(1, bottom - top),
+    }
+    with mss.mss() as screenshotter:
+        grabbed = screenshotter.grab(region)
         return Image.frombytes("RGB", grabbed.size, grabbed.rgb)
 
 
@@ -626,6 +648,7 @@ class CheckersAdvisorApp:
         self.root.minsize(940, 620)
 
         self.screenshot: Optional[Image.Image] = None
+        self.screenshot_origin = (0, 0)
         self.result_image: Optional[Image.Image] = None
         self.screen_photo: Optional[ImageTk.PhotoImage] = None
         self.result_photo: Optional[ImageTk.PhotoImage] = None
@@ -634,15 +657,22 @@ class CheckersAdvisorApp:
         self.selection_display: Optional[Tuple[float, float, float, float]] = None
         self.selection_image: Optional[Tuple[int, int, int, int]] = None
         self.drag_start: Optional[Tuple[float, float]] = None
+        self.start_realtime_on_selection = False
+        self.realtime_running = False
+        self.realtime_after_id: Optional[str] = None
+        self.last_realtime_error = ""
 
         self.status_var = tk.StringVar(value="พร้อมใช้งาน")
         self.our_side_var = tk.StringVar(value="ล่าง")
         self.our_color_var = tk.StringVar(value="อัตโนมัติ")
         self.threshold_var = tk.IntVar(value=60)
         self.monitor_var = tk.IntVar(value=0)
+        self.interval_var = tk.IntVar(value=700)
         self.backward_capture_var = tk.BooleanVar(value=False)
+        self.realtime_button_text = tk.StringVar(value="เริ่มเรียลไทม์")
 
         self.build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def build_ui(self) -> None:
         style = ttk.Style()
@@ -652,13 +682,23 @@ class CheckersAdvisorApp:
         toolbar = ttk.Frame(self.root, style="Toolbar.TFrame")
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(toolbar, text="จับหน้าจอ", command=self.capture_clicked).pack(
+        ttk.Button(toolbar, text="เลือกพื้นที่หน้าจอ", command=self.select_live_region_clicked).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(toolbar, text="จับภาพนิ่ง", command=self.capture_clicked).pack(
             side=tk.LEFT, padx=(0, 6)
         )
         ttk.Button(toolbar, text="เปิดภาพ", command=self.open_image).pack(
             side=tk.LEFT, padx=(0, 6)
         )
         ttk.Button(toolbar, text="วิเคราะห์", command=self.analyze_selection).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(
+            toolbar,
+            textvariable=self.realtime_button_text,
+            command=self.toggle_realtime,
+        ).pack(
             side=tk.LEFT, padx=(0, 12)
         )
         ttk.Button(toolbar, text="บันทึกภาพ", command=self.save_result).pack(
@@ -672,6 +712,16 @@ class CheckersAdvisorApp:
             to=8,
             width=3,
             textvariable=self.monitor_var,
+        ).pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(toolbar, text="รีเฟรช ms").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            toolbar,
+            from_=250,
+            to=3000,
+            increment=50,
+            width=5,
+            textvariable=self.interval_var,
         ).pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(toolbar, text="เราอยู่").pack(side=tk.LEFT)
@@ -758,7 +808,15 @@ class CheckersAdvisorApp:
             return "light"
         return "auto"
 
+    def select_live_region_clicked(self) -> None:
+        self.prepare_screen_selection(auto_start_realtime=True)
+
     def capture_clicked(self) -> None:
+        self.prepare_screen_selection(auto_start_realtime=False)
+
+    def prepare_screen_selection(self, auto_start_realtime: bool) -> None:
+        self.stop_realtime(status=False)
+        self.start_realtime_on_selection = auto_start_realtime
         self.status_var.set("กำลังจับหน้าจอ...")
         self.root.update_idletasks()
         self.root.withdraw()
@@ -766,14 +824,20 @@ class CheckersAdvisorApp:
 
     def capture_after_hide(self) -> None:
         try:
-            self.screenshot = capture_screen(self.monitor_var.get())
+            capture = capture_screen(self.monitor_var.get())
+            self.screenshot = capture.image
+            self.screenshot_origin = (capture.left, capture.top)
             self.selection_display = None
             self.selection_image = None
             self.result_image = None
-            self.status_var.set("จับหน้าจอแล้ว ลากเลือกกระดาน 8x8")
+            if self.start_realtime_on_selection:
+                self.status_var.set("ลากเลือกกระดาน 8x8 แล้วจะเริ่มเรียลไทม์ทันที")
+            else:
+                self.status_var.set("จับภาพนิ่งแล้ว ลากเลือกกระดาน 8x8")
         except Exception as exc:
             messagebox.showerror("จับหน้าจอไม่สำเร็จ", str(exc))
             self.status_var.set("จับหน้าจอไม่สำเร็จ")
+            self.start_realtime_on_selection = False
         finally:
             self.root.deiconify()
             self.root.lift()
@@ -791,7 +855,9 @@ class CheckersAdvisorApp:
         if not path:
             return
         try:
+            self.stop_realtime(status=False)
             self.screenshot = Image.open(path).convert("RGB")
+            self.screenshot_origin = (0, 0)
             self.selection_display = None
             self.selection_image = None
             self.result_image = None
@@ -825,7 +891,7 @@ class CheckersAdvisorApp:
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="จับหน้าจอหรือเปิดภาพ",
+                text="เลือกพื้นที่หน้าจอหรือเปิดภาพ",
                 fill="#d8dee9",
                 font=("Helvetica", 16),
             )
@@ -924,6 +990,7 @@ class CheckersAdvisorApp:
     def on_screen_press(self, event: tk.Event) -> None:
         if self.screenshot is None:
             return
+        self.stop_realtime(status=False)
         self.drag_start = self.clamp_to_display_image(event.x, event.y)
         self.selection_display = None
         self.selection_image = None
@@ -943,8 +1010,12 @@ class CheckersAdvisorApp:
             x0, y0, x1, y1 = self.selection_image
             if min(x1 - x0, y1 - y0) < 80:
                 self.status_var.set("กรอบกระดานเล็กเกินไป")
+                self.start_realtime_on_selection = False
                 return
             self.status_var.set(f"เลือกกระดานแล้ว: {x1 - x0}x{y1 - y0}px")
+            if self.start_realtime_on_selection:
+                self.start_realtime_on_selection = False
+                self.start_realtime()
 
     def square_display_rect(
         self, start: Tuple[float, float], end: Tuple[float, float]
@@ -976,16 +1047,21 @@ class CheckersAdvisorApp:
         side = min(right - left, bottom - top)
         return (left, top, left + side, top + side)
 
-    def analyze_selection(self) -> None:
-        if self.screenshot is None:
-            messagebox.showinfo("ยังไม่มีภาพ", "กรุณาจับหน้าจอหรือเปิดภาพก่อน")
-            return
+    def selected_screen_rect(self) -> Optional[Tuple[int, int, int, int]]:
         if self.selection_image is None:
-            messagebox.showinfo("ยังไม่ได้เลือกกระดาน", "ลากกรอบรอบกระดานก่อน")
-            return
-
+            return None
+        origin_x, origin_y = self.screenshot_origin
         left, top, right, bottom = self.selection_image
-        board_image = self.screenshot.crop((left, top, right, bottom)).convert("RGB")
+        return (
+            origin_x + left,
+            origin_y + top,
+            origin_x + right,
+            origin_y + bottom,
+        )
+
+    def analyze_board_image(
+        self, board_image: Image.Image, realtime: bool = False
+    ) -> Tuple[int, Optional[Move], List[CellSample]]:
         threshold = max(15, 105 - int(round(float(self.threshold_var.get()))))
         board, samples = detect_board(
             board_image,
@@ -1000,10 +1076,82 @@ class CheckersAdvisorApp:
         )
         self.result_image = annotate_board(board_image, board, move)
         pieces = sum(1 for row in board for piece in row if piece is not None)
-        self.status_var.set(f"{describe_move(move)} | พบหมาก {pieces} ตัว")
+
         if not samples:
             self.status_var.set("ไม่พบหมาก ลองเพิ่มค่า ความไว หรือเลือกกรอบใหม่")
+        else:
+            prefix = "เรียลไทม์" if realtime else "ภาพนิ่ง"
+            self.status_var.set(f"{prefix}: {describe_move(move)} | พบหมาก {pieces} ตัว")
+
         self.redraw_result()
+        return pieces, move, samples
+
+    def analyze_selection(self) -> None:
+        if self.screenshot is None:
+            messagebox.showinfo("ยังไม่มีภาพ", "กรุณาจับหน้าจอหรือเปิดภาพก่อน")
+            return
+        if self.selection_image is None:
+            messagebox.showinfo("ยังไม่ได้เลือกกระดาน", "ลากกรอบรอบกระดานก่อน")
+            return
+
+        left, top, right, bottom = self.selection_image
+        board_image = self.screenshot.crop((left, top, right, bottom)).convert("RGB")
+        self.analyze_board_image(board_image, realtime=False)
+
+    def toggle_realtime(self) -> None:
+        if self.realtime_running:
+            self.stop_realtime(status=True)
+        else:
+            self.start_realtime()
+
+    def start_realtime(self) -> None:
+        if self.selected_screen_rect() is None:
+            messagebox.showinfo("ยังไม่ได้เลือกกระดาน", "เลือกพื้นที่หน้าจอก่อน")
+            return
+
+        self.realtime_running = True
+        self.last_realtime_error = ""
+        self.realtime_button_text.set("หยุดเรียลไทม์")
+        self.status_var.set("เริ่มวิเคราะห์แบบเรียลไทม์")
+        self.run_realtime_tick()
+
+    def stop_realtime(self, status: bool = True) -> None:
+        if self.realtime_after_id is not None:
+            self.root.after_cancel(self.realtime_after_id)
+            self.realtime_after_id = None
+        was_running = self.realtime_running
+        self.realtime_running = False
+        self.realtime_button_text.set("เริ่มเรียลไทม์")
+        if status and was_running:
+            self.status_var.set("หยุดเรียลไทม์แล้ว")
+
+    def run_realtime_tick(self) -> None:
+        if not self.realtime_running:
+            return
+
+        try:
+            screen_rect = self.selected_screen_rect()
+            if screen_rect is None:
+                self.stop_realtime(status=False)
+                self.status_var.set("หยุดเรียลไทม์: ยังไม่ได้เลือกกระดาน")
+                return
+
+            board_image = capture_screen_region(screen_rect).convert("RGB")
+            self.analyze_board_image(board_image, realtime=True)
+            self.last_realtime_error = ""
+        except Exception as exc:
+            message = str(exc)
+            if message != self.last_realtime_error:
+                self.status_var.set(f"เรียลไทม์ผิดพลาด: {message}")
+                self.last_realtime_error = message
+
+        if self.realtime_running:
+            delay = max(250, int(self.interval_var.get()))
+            self.realtime_after_id = self.root.after(delay, self.run_realtime_tick)
+
+    def close(self) -> None:
+        self.stop_realtime(status=False)
+        self.root.destroy()
 
 
 def main() -> None:
